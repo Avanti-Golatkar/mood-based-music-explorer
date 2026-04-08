@@ -1,27 +1,11 @@
-/**
- * MOOD PLAYLIST GENERATOR — FULL REACT SHOWCASE + SPOTIFY API
- * ─────────────────────────────────────────────────────────────
- * JSX · Components · Component API · Life Cycle · Constructors
- * React Dev Tools · State · Props · Props Validation · Styling
- * Hooks · Custom Hooks · Context API · Custom Hash Router
- * ── NEW ──
- * Spotify PKCE OAuth · Spotify Web API · Audio Preview Playback
- *
- * SETUP:
- *  1. Go to https://developer.spotify.com/dashboard → Create App
- *  2. Add Redirect URI: http://localhost:3000  (or your dev server URL)
- *  3. Copy your Client ID below
- *  4. npm install && npm start
- */
-
-// ── §1  IMPORTS ────────────────────────────────────────────────────────────
+//1) IMPORTS 
 import {
   useState, useEffect, useRef, useCallback,
   useContext, createContext, Component, memo,
   useMemo, useReducer, Fragment,
 } from "react";
 
-// ── §2  PROP-TYPES SHIM ────────────────────────────────────────────────────
+//2) PROP-TYPES SHIM 
 const _mk = (n) => { const t={_t:n}; t.isRequired={...t,_r:true}; return t; };
 const PropTypes = {
   string:_mk("string"), number:_mk("number"), bool:_mk("bool"),
@@ -33,15 +17,17 @@ const PropTypes = {
   oneOfType:(a)=>{ const t={_t:"oneOfType",_a:a};t.isRequired={...t,_r:true}; return t; },
 };
 
-// ── §3  SPOTIFY CONFIG — REPLACE WITH YOUR CLIENT ID ──────────────────────
-const SPOTIFY_CLIENT_ID   = "f210f5397cda4bfab0325c8aea87c17c"; // ← paste yours here
+//3) SPOTIFY CONFIG 
+const SPOTIFY_CLIENT_ID   = "f210f5397cda4bfab0325c8aea87c17c"; 
 const SPOTIFY_SCOPES      = "playlist-read-public playlist-read-collaborative";
 const SPOTIFY_TOKEN_KEY   = "sp_token";
 const SPOTIFY_EXPIRY_KEY  = "sp_expiry";
 const SPOTIFY_VERIFIER_KEY= "sp_verifier";
-const SPOTIFY_REDIRECT    = () => window.location.origin + window.location.pathname;
+const SPOTIFY_REDIRECT = () => "https://mood-based-playlist-pearl.vercel.app/";
+console.log("[MoodPlay] Redirect URI:", SPOTIFY_REDIRECT()); // remove after debugging
+console.log("Redirect URI being used:", SPOTIFY_REDIRECT()); 
 
-// ── §4  MOOD DATA (with Spotify search query per mood) ─────────────────────
+//4) MOOD DATA 
 const MOODS = [
   { id:"euphoric",    label:"Euphoric",    emoji:"✦", desc:"Sky-high & electric",   spotifyQuery:"euphoric feel good dance",
     palette:{ bg:["#0d0221","#1a0533","#2d0a5e"], accent:"#c77dff", secondary:"#9d4edd", glow:"#7b2fff", text:"#f0e6ff", muted:"#9d8bbd", orb1:"#6b21a8", orb2:"#4c1d95", warp:"#c77dff", sphere:"#9d4edd" }},
@@ -62,7 +48,7 @@ const MOODS = [
 ];
 const DEFAULT_PALETTE = MOODS[0].palette;
 
-// ── §5  CONTEXTS ───────────────────────────────────────────────────────────
+//5) CONTEXTS 
 const ThemeContext   = createContext({ palette: DEFAULT_PALETTE, moodId: null });
 const RouterContext  = createContext({ path:"/", params:{}, navigate:()=>{}, goBack:()=>{} });
 const SpotifyContext = createContext({ token:null, isAuthenticated:false, login:()=>{}, logout:()=>{}, authLoading:false, authError:null });
@@ -70,7 +56,7 @@ ThemeContext.displayName   = "ThemeContext";
 RouterContext.displayName  = "RouterContext";
 SpotifyContext.displayName = "SpotifyContext";
 
-// ── §6  REDUCERS ───────────────────────────────────────────────────────────
+//6) REDUCERS
 const SA = { START:"START", SUCCESS:"SUCCESS", ERROR:"ERROR", RESET:"RESET" };
 const spInit = { playlist:null, tracks:[], loading:false, error:null };
 function spotifyReducer(state, action) {
@@ -83,7 +69,7 @@ function spotifyReducer(state, action) {
   }
 }
 
-// ── §7  SPOTIFY PKCE HELPERS ───────────────────────────────────────────────
+//7) SOTIFY PKCE HELPERS 
 function generateCodeVerifier() {
   const arr = new Uint8Array(32);
   window.crypto.getRandomValues(arr);
@@ -95,11 +81,7 @@ async function generateCodeChallenge(verifier) {
   return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
 }
 
-// ── §7b  CAPTURE AUTH CODE BEFORE REACT MOUNTS ────────────────────────────
-// Spotify redirects back with ?code= or ?error= in the query string.
-// We snapshot these immediately at module-load time and stash them in
-// sessionStorage so that nothing (hash-router, replaceState, etc.) can
-// destroy them before useSpotifyAuth's useEffect runs.
+//CAPTURE AUTH CODE BEFORE REACT MOUNTS 
 const SPOTIFY_CODE_KEY  = "sp_auth_code";
 const SPOTIFY_ERR_KEY   = "sp_auth_error";
 (function captureAuthParams() {
@@ -116,9 +98,9 @@ const SPOTIFY_ERR_KEY   = "sp_auth_error";
   }
 })();
 
-// ── §8  CUSTOM HOOKS ───────────────────────────────────────────────────────
+//8) CUSTOM HOOKS 
 
-/** useMoodTheme — derives palette+mood from id. Demonstrates: useMemo */
+//derives palette+mood from id
 function useMoodTheme(moodId) {
   return useMemo(() => {
     const mood = MOODS.find(m => m.id === moodId);
@@ -126,31 +108,28 @@ function useMoodTheme(moodId) {
   }, [moodId]);
 }
 
-/**
- * useSpotifyAuth — PKCE OAuth flow
- * Demonstrates: Custom Hook, useState, useEffect, useCallback, async/await,
- *               sessionStorage persistence, URL param handling
- */
+
+//useSpotifyAuth — PKCE OAuth flow
 function useSpotifyAuth() {
   const [token,       setToken]       = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError,   setAuthError]   = useState(null);
 
   useEffect(() => {
-    // 1. Restore a still-valid token
+    //Restore a still-valid token
     const expiry = parseInt(sessionStorage.getItem(SPOTIFY_EXPIRY_KEY) ?? "0", 10);
     const stored = sessionStorage.getItem(SPOTIFY_TOKEN_KEY);
     if (stored && Date.now() < expiry) { setToken(stored); return; }
 
-    // 2. Check for an error captured at module-load time
+    //Check for an error captured at module-load time
     const errParam = sessionStorage.getItem(SPOTIFY_ERR_KEY);
     if (errParam) {
       sessionStorage.removeItem(SPOTIFY_ERR_KEY);
-      setAuthError("Spotify authorization was denied. Make sure your Redirect URI in the Spotify dashboard exactly matches: " + SPOTIFY_REDIRECT());
+      setAuthError(`Spotify error: "${errParam}" — Redirect URI sent was: ${SPOTIFY_REDIRECT()}`);
       return;
     }
 
-    // 3. Check for an auth code captured at module-load time
+    //Check for an auth code captured at module-load time
     const code = sessionStorage.getItem(SPOTIFY_CODE_KEY);
     if (!code) return;
 
@@ -217,9 +196,7 @@ function useSpotifyAuth() {
   return { token, isAuthenticated: !!token, login, logout, authLoading, authError };
 }
 
-/**
- * useSpotifyMoodPlaylist — search Spotify for mood playlists + fetch tracks
- */
+//search spotify for mood playlists and fetch tracks
 function useSpotifyMoodPlaylist(token) {
   const [state, dispatch] = useReducer(spotifyReducer, spInit);
 
@@ -261,9 +238,7 @@ function useSpotifyMoodPlaylist(token) {
   return { ...state, search, reset };
 }
 
-/**
- * useAudioPreview — 30-second Spotify track preview player
- */
+//30 seconds audio preview
 function useAudioPreview() {
   const audioRef          = useRef(null);
   const [playingId, setPlayingId] = useState(null);
@@ -303,7 +278,7 @@ function useAudioPreview() {
   return { playingId, progress, toggle };
 }
 
-/** useAnimationFrame — rAF loop */
+//rAF loop
 function useAnimationFrame(callback) {
   const rafRef = useRef(null);
   const cbRef  = useRef(callback);
@@ -315,7 +290,7 @@ function useAnimationFrame(callback) {
   }, []);
 }
 
-// ── §9  HASH ROUTER — Class Component ─────────────────────────────────────
+//9) HASH ROUTER 
 class HashRouter extends Component {
   constructor(props) {
     super(props);
@@ -347,7 +322,7 @@ class HashRouter extends Component {
 HashRouter.displayName = "HashRouter";
 HashRouter.propTypes   = { children: PropTypes.node.isRequired };
 
-// ── §10  ROUTE ─────────────────────────────────────────────────────────────
+//10) ROUTE 
 function Route({ path, component: Comp, exact }) {
   const { path: cur } = useContext(RouterContext);
   return (exact ? cur===path : cur.startsWith(path)) ? <Comp /> : null;
@@ -356,7 +331,7 @@ Route.displayName  = "Route";
 Route.propTypes    = { path:PropTypes.string.isRequired, component:PropTypes.func.isRequired, exact:PropTypes.bool };
 Route.defaultProps = { exact: true };
 
-// ── §11  THEME PROVIDER ────────────────────────────────────────────────────
+//11) THEME PROVIDER 
 function ThemeProvider({ moodId, children }) {
   const { palette } = useMoodTheme(moodId);
   return <ThemeContext.Provider value={{ palette, moodId }}>{children}</ThemeContext.Provider>;
@@ -365,7 +340,7 @@ ThemeProvider.displayName  = "ThemeProvider";
 ThemeProvider.propTypes    = { moodId:PropTypes.string, children:PropTypes.node.isRequired };
 ThemeProvider.defaultProps = { moodId: null };
 
-// ── §12  SPOTIFY PROVIDER ─────────────────────────────────────────────────
+//12) SPOTIFY PROVIDER 
 function SpotifyProvider({ children }) {
   const auth = useSpotifyAuth();
   return (
@@ -377,7 +352,7 @@ function SpotifyProvider({ children }) {
 SpotifyProvider.displayName = "SpotifyProvider";
 SpotifyProvider.propTypes   = { children: PropTypes.node.isRequired };
 
-// ── §13  SPACE BACKGROUND ─────────────────────────────────────────────────
+//13) SPACE BACKGROUND 
 function SpaceBackground({ palette }) {
   const canvasRef = useRef(null);
   const dataRef   = useRef(null);
@@ -415,7 +390,7 @@ function SpaceBackground({ palette }) {
 SpaceBackground.displayName = "SpaceBackground";
 SpaceBackground.propTypes   = { palette: PropTypes.shape({ bg:PropTypes.array.isRequired, orb1:PropTypes.string.isRequired, orb2:PropTypes.string.isRequired, warp:PropTypes.string.isRequired }).isRequired };
 
-// ── §14  WIREFRAME SPHERE ─────────────────────────────────────────────────
+//14) WIREFRAME SPHERE 
 function WireframeSphere({ size, color }) {
   const canvasRef=useRef(null), tRef=useRef(0);
   useEffect(()=>{ const c=canvasRef.current; if(c){c.width=c.height=size;} },[size]);
@@ -438,7 +413,7 @@ WireframeSphere.displayName  = "WireframeSphere";
 WireframeSphere.propTypes    = { size:PropTypes.number, color:PropTypes.string.isRequired };
 WireframeSphere.defaultProps = { size: 140 };
 
-// ── §15  NAV BAR ──────────────────────────────────────────────────────────
+//15) NAV BAR 
 function NavBar({ activeMoodId }) {
   const {navigate, path} = useContext(RouterContext);
   const {palette}        = useContext(ThemeContext);
@@ -477,7 +452,7 @@ NavBar.displayName = "NavBar";
 NavBar.propTypes   = { activeMoodId: PropTypes.string };
 NavBar.defaultProps = { activeMoodId: null };
 
-// ── §16  MOOD CARD ────────────────────────────────────────────────────────
+//16) MOOD CARD 
 const MoodCard = memo(function MoodCard({ mood, isSelected, onSelect, onHover, onLeave, animIndex }) {
   const style = {
     padding:"15px 10px",borderRadius:13,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:6,transition:"all 0.3s",
@@ -500,7 +475,7 @@ MoodCard.displayName  = "MoodCard";
 MoodCard.propTypes    = { mood:PropTypes.shape({id:PropTypes.string.isRequired,label:PropTypes.string.isRequired,emoji:PropTypes.string.isRequired,desc:PropTypes.string.isRequired,palette:PropTypes.object.isRequired}).isRequired, isSelected:PropTypes.bool, onSelect:PropTypes.func.isRequired, onHover:PropTypes.func.isRequired, onLeave:PropTypes.func.isRequired, animIndex:PropTypes.number };
 MoodCard.defaultProps = { isSelected:false, animIndex:0 };
 
-// ── §17  SPOTIFY SONG ROW ─────────────────────────────────────────────────
+//17) SPOTIFY SONG ROW 
 const SpotifySongRow = memo(function SpotifySongRow({ track, index, playingId, onToggle }) {
   const { palette }  = useContext(ThemeContext);
   const [hov, setHov] = useState(false);
@@ -571,7 +546,7 @@ SpotifySongRow.propTypes   = {
   onToggle:  PropTypes.func.isRequired,
 };
 
-// ── §18  SPOTIFY CONNECT BANNER ───────────────────────────────────────────
+//18) SPOTIFY CONNECT BANNER 
 function SpotifyConnectBanner() {
   const { login, authLoading, authError } = useContext(SpotifyContext);
   const { palette } = useContext(ThemeContext);
@@ -613,7 +588,7 @@ function SpotifyConnectBanner() {
 }
 SpotifyConnectBanner.displayName = "SpotifyConnectBanner";
 
-// ── §19  HOME VIEW — Class Component ──────────────────────────────────────
+//19) HOME VIEW 
 class HomeView extends Component {
   constructor(props) {
     super(props);
@@ -673,7 +648,7 @@ HomeView.contextType  = ThemeContext;
 HomeView.propTypes    = { onMoodSelect:PropTypes.func.isRequired, onMoodPreview:PropTypes.func, preselectedMood:PropTypes.string };
 HomeView.defaultProps = { onMoodPreview:null, preselectedMood:null };
 
-// ── §20  PLAYLIST VIEW ────────────────────────────────────────────────────
+//20) PLAYLIST VIEW 
 function PlaylistView() {
   const {params, navigate}       = useContext(RouterContext);
   const {palette}                = useContext(ThemeContext);
@@ -783,7 +758,7 @@ function PlaylistView() {
 }
 PlaylistView.displayName = "PlaylistView";
 
-// ── §21  ABOUT VIEW ───────────────────────────────────────────────────────
+//21) ABOUT VIEW 
 function AboutView() {
   const {palette}  = useContext(ThemeContext);
   const {navigate} = useContext(RouterContext);
@@ -860,10 +835,10 @@ function AboutView() {
 }
 AboutView.displayName = "AboutView";
 
-// ── §22  SHARED STYLE FACTORY ─────────────────────────────────────────────
+//22) SHARED STYLE FACTORY 
 const btn = (p) => ({ padding:"8px 18px",borderRadius:8,background:"transparent",border:`1px solid ${p.accent}50`,color:p.accent,fontSize:12,cursor:"pointer",fontFamily:"inherit",transition:"all 0.2s" });
 
-// ── §23  APP SHELL ────────────────────────────────────────────────────────
+//23) APP SHELL
 function AppShell({ onMoodSelect, onMoodPreview, activeMoodId }) {
   const {palette} = useContext(ThemeContext);
   const {path}    = useContext(RouterContext);
@@ -906,7 +881,7 @@ AppShell.displayName  = "AppShell";
 AppShell.propTypes    = { onMoodSelect:PropTypes.func.isRequired, onMoodPreview:PropTypes.func.isRequired, activeMoodId:PropTypes.string };
 AppShell.defaultProps = { activeMoodId: null };
 
-// ── §24  ROOT APP — Class Component ───────────────────────────────────────
+//24) ROOT APP 
 class App extends Component {
   constructor(props) {
     super(props);
