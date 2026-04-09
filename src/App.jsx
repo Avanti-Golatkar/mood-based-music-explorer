@@ -20,12 +20,13 @@ const PropTypes = {
 //3) SPOTIFY CONFIG
 const SPOTIFY_CLIENT_ID    = "f210f5397cda4bfab0325c8aea87c17c";
 
-// FIX #1: "playlist-read-public" is NOT a valid Spotify scope — it does not exist.
-// Public playlists are accessible with just a valid token; no scope is needed for them.
-// Requesting a non-existent scope causes Spotify to return "invalid_scope" immediately
-// and reject the entire OAuth flow before the user even sees the consent screen.
-// Only request scopes that actually exist. "playlist-read-collaborative" is valid.
-// "playlist-read-private" is added so the user's own private playlists are also readable.
+// FIX #1 — THE PRIMARY BUG: "playlist-read-public" is NOT a valid Spotify scope.
+// It never existed. Spotify rejects the entire /authorize request when any scope
+// in the string is unrecognized, returning error="invalid_scope" before the user
+// even sees the login screen. The correct scopes are:
+//   "playlist-read-private"       — lets your app read a user's private playlists
+//   "playlist-read-collaborative" — includes collaborative playlists in that list
+// Public playlists (used for Search) require NO scope at all.
 const SPOTIFY_SCOPES       = "playlist-read-private playlist-read-collaborative";
 
 const SPOTIFY_TOKEN_KEY    = "sp_token";
@@ -75,10 +76,11 @@ function spotifyReducer(state, action) {
   }
 }
 
-//7) SPOTIFY PKCE HELPERS — unchanged, these were correct
+//7) SPOTIFY PKCE HELPERS
 function generateCodeVerifier() {
   const arr = new Uint8Array(32);
   window.crypto.getRandomValues(arr);
+  // base64url (not standard base64): replace +→- /→_ strip =
   return btoa(String.fromCharCode(...arr))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
@@ -93,7 +95,11 @@ async function generateCodeChallenge(verifier) {
     .replace(/=/g, "");
 }
 
-// CAPTURE AUTH CODE BEFORE REACT MOUNTS — unchanged, this was correct
+// CAPTURE AUTH CODE BEFORE REACT MOUNTS
+// This IIFE runs synchronously at module-load time before any React component
+// renders. It grabs ?code= or ?error= out of the URL immediately and stores
+// them in sessionStorage, then cleans the URL so the code cannot be replayed
+// on a re-render or back-navigation.
 const SPOTIFY_CODE_KEY = "sp_auth_code";
 const SPOTIFY_ERR_KEY  = "sp_auth_error";
 (function captureAuthParams() {
@@ -119,39 +125,52 @@ function useMoodTheme(moodId) {
   }, [moodId]);
 }
 
-// useSpotifyAuth — PKCE OAuth flow (logic unchanged; only scope was broken)
+// useSpotifyAuth — full PKCE OAuth flow
 function useSpotifyAuth() {
   const [token,       setToken]       = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError,   setAuthError]   = useState(null);
 
   useEffect(() => {
-    // Restore a still-valid token
+    // 1. Restore a still-valid token from sessionStorage
     const expiry = parseInt(sessionStorage.getItem(SPOTIFY_EXPIRY_KEY) ?? "0", 10);
     const stored = sessionStorage.getItem(SPOTIFY_TOKEN_KEY);
-    if (stored && Date.now() < expiry) { setToken(stored); return; }
-
-    // Check for an error captured at module-load time
-    const errParam = sessionStorage.getItem(SPOTIFY_ERR_KEY);
-    if (errParam) {
-      sessionStorage.removeItem(SPOTIFY_ERR_KEY);
-      setAuthError(`Spotify error: "${errParam}"`);
+    if (stored && Date.now() < expiry) {
+      setToken(stored);
       return;
     }
 
-    // Check for an auth code captured at module-load time
+    // 2. Check for an OAuth error captured before React mounted
+    const errParam = sessionStorage.getItem(SPOTIFY_ERR_KEY);
+    if (errParam) {
+      sessionStorage.removeItem(SPOTIFY_ERR_KEY);
+      // Give actionable guidance for the most common error
+      setAuthError(
+        errParam === "invalid_scope"
+          ? 'Spotify rejected the authorization because one or more scope names were invalid. ' +
+            '"playlist-read-public" does not exist — use "playlist-read-private" instead. ' +
+            'Check that SPOTIFY_SCOPES only contains scopes from Spotify\'s official list.'
+          : `Spotify returned an authorization error: "${errParam}". ` +
+            `Verify your Client ID, Redirect URI, and scope values in the Spotify Developer Dashboard.`
+      );
+      return;
+    }
+
+    // 3. Check for an auth code captured before React mounted
     const code = sessionStorage.getItem(SPOTIFY_CODE_KEY);
     if (!code) return;
 
     const verifier = sessionStorage.getItem(SPOTIFY_VERIFIER_KEY);
     if (!verifier) {
       sessionStorage.removeItem(SPOTIFY_CODE_KEY);
-      setAuthError("Auth session expired — please try connecting again.");
+      setAuthError("Auth session expired (code_verifier missing). Please try connecting again.");
       return;
     }
 
+    // 4. Exchange the authorization code + code_verifier for an access token
     sessionStorage.removeItem(SPOTIFY_CODE_KEY);
     setAuthLoading(true);
+
     fetch("https://accounts.spotify.com/api/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -160,31 +179,36 @@ function useSpotifyAuth() {
         grant_type:    "authorization_code",
         code,
         redirect_uri:  SPOTIFY_REDIRECT(),
-        code_verifier: verifier,
+        code_verifier: verifier,   // PKCE: sent instead of client_secret
       }),
     })
-    .then(r => r.json())
-    .then(d => {
-      if (d.access_token) {
-        sessionStorage.setItem(SPOTIFY_TOKEN_KEY,  d.access_token);
-        sessionStorage.setItem(SPOTIFY_EXPIRY_KEY, String(Date.now() + d.expires_in * 1000));
-        sessionStorage.removeItem(SPOTIFY_VERIFIER_KEY);
-        setToken(d.access_token);
-      } else {
-        setAuthError(d.error_description ?? "Token exchange failed — check your Client ID and Redirect URI.");
-      }
-    })
-    .catch(() => setAuthError("Network error during auth. Please try again."))
-    .finally(() => setAuthLoading(false));
+      .then(r => r.json())
+      .then(d => {
+        if (d.access_token) {
+          sessionStorage.setItem(SPOTIFY_TOKEN_KEY,  d.access_token);
+          sessionStorage.setItem(SPOTIFY_EXPIRY_KEY, String(Date.now() + d.expires_in * 1000));
+          sessionStorage.removeItem(SPOTIFY_VERIFIER_KEY);
+          setToken(d.access_token);
+        } else {
+          setAuthError(
+            d.error_description
+              ?? `Token exchange failed (${d.error ?? "unknown error"}). ` +
+                 `Check that your Client ID and Redirect URI exactly match the Spotify Developer Dashboard.`
+          );
+        }
+      })
+      .catch(() => setAuthError("Network error during token exchange. Please check your connection and try again."))
+      .finally(() => setAuthLoading(false));
   }, []);
 
   const login = useCallback(async () => {
     if (!SPOTIFY_CLIENT_ID || SPOTIFY_CLIENT_ID === "YOUR_SPOTIFY_CLIENT_ID") {
-      setAuthError("Set your SPOTIFY_CLIENT_ID in the code first.");
+      setAuthError("Set your SPOTIFY_CLIENT_ID constant at the top of the file first.");
       return;
     }
     const verifier  = generateCodeVerifier();
     const challenge = await generateCodeChallenge(verifier);
+    // Store verifier BEFORE redirecting — it must survive the page navigation
     sessionStorage.setItem(SPOTIFY_VERIFIER_KEY, verifier);
 
     const url = new URL("https://accounts.spotify.com/authorize");
@@ -206,7 +230,7 @@ function useSpotifyAuth() {
   return { token, isAuthenticated: !!token, login, logout, authLoading, authError };
 }
 
-// Search Spotify for mood playlists and fetch tracks
+// Search Spotify for mood playlists and fetch their tracks
 function useSpotifyMoodPlaylist(token) {
   const [state, dispatch] = useReducer(spotifyReducer, spInit);
 
@@ -215,22 +239,29 @@ function useSpotifyMoodPlaylist(token) {
     const mood = MOODS.find(m => m.id === moodId);
     if (!mood) return;
     dispatch({ type: SA.START });
-
     try {
-      // FIX #2 (Feb 2026): Search limit max is now 10. We request 10 and pick the best.
-      // We also drop the "market" param — hardcoding "US" silently excludes non-US users.
+      // FIX #4: Removed market=US — it can silently exclude results for non-US
+      // users and is unnecessary for searching public playlists.
       const sRes = await fetch(
-        `https://api.spotify.com/v1/search?q=${encodeURIComponent(mood.spotifyQuery)}&type=playlist&limit=10`,
+        `https://api.spotify.com/v1/search?q=${encodeURIComponent(mood.spotifyQuery)}&type=playlist&limit=8`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
+
       if (sRes.status === 401) {
         dispatch({ type: SA.ERROR, err: "Session expired — please reconnect Spotify." });
         return;
       }
-      if (!sRes.ok) {
-        dispatch({ type: SA.ERROR, err: `Spotify search error (${sRes.status}). Try again.` });
+      // FIX: Explicit 403 handling for Development Mode allowlist failures
+      if (sRes.status === 403) {
+        dispatch({
+          type: SA.ERROR,
+          err: "Access denied (403). In Development Mode, every Spotify user must be added to " +
+               "the app's allowlist under User Management in the Spotify Developer Dashboard. " +
+               "Also confirm the app owner has an active Spotify Premium subscription.",
+        });
         return;
       }
+
       const sData = await sRes.json();
       const items = sData.playlists?.items?.filter(Boolean) ?? [];
       if (!items.length) {
@@ -238,29 +269,19 @@ function useSpotifyMoodPlaylist(token) {
         return;
       }
 
-      // Prefer playlists with cover art and at least some tracks
-      const playlist =
-        items.find(p => p.images?.length && p.tracks?.total >= 10) ?? items[0];
+      const playlist = items.find(p => p.images?.length && p.tracks?.total >= 10) ?? items[0];
 
-      // FIX #3 (Feb 2026): The endpoint was renamed from /tracks to /items.
-      // Also dropped "market=US" to support all regions.
-      // NOTE (Feb 2026): Due to Spotify's new data access restrictions, track items
-      // are only guaranteed for playlists you own. For third-party public playlists
-      // in dev mode, the items array may come back empty. We handle that gracefully.
+      // FIX #5: Use the current non-deprecated endpoint /playlists/{id}/items.
+      // The old /playlists/{id}/tracks endpoint is deprecated as of Feb 2026.
       const tRes = await fetch(
         `https://api.spotify.com/v1/playlists/${playlist.id}/items?limit=10` +
         `&fields=items(track(id,name,artists,album(name,images),duration_ms,external_urls,preview_url))`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      if (!tRes.ok) {
-        // If items endpoint fails (e.g. 403 due to new Feb 2026 restrictions),
-        // still show the playlist metadata so the user can open it on Spotify.
-        dispatch({ type: SA.SUCCESS, playlist, tracks: [] });
-        return;
-      }
+
       const tData  = await tRes.json();
       const tracks = (tData.items ?? [])
-        .filter(it => it?.track && !it.track.is_local && it.track.name)
+        .filter(it => it.track && !it.track.is_local && it.track.name)
         .map(it => it.track)
         .slice(0, 8);
 
@@ -274,14 +295,14 @@ function useSpotifyMoodPlaylist(token) {
   return { ...state, search, reset };
 }
 
-// 30-second audio preview
+// 30-second audio preview with rAF progress tracking
 function useAudioPreview() {
   const audioRef              = useRef(null);
   const [playingId, setPlayingId] = useState(null);
-  const [progress, setProgress]   = useState(0);
+  const [progress,  setProgress]  = useState(0);
   const rafRef                = useRef(null);
 
-  const stopProgress = () => { cancelAnimationFrame(rafRef.current); };
+  const stopProgress  = () => { cancelAnimationFrame(rafRef.current); };
   const startProgress = (audio) => {
     const tick = () => {
       setProgress(audio.duration ? audio.currentTime / audio.duration : 0);
@@ -314,7 +335,7 @@ function useAudioPreview() {
   return { playingId, progress, toggle };
 }
 
-// rAF loop
+// rAF animation loop hook
 function useAnimationFrame(callback) {
   const rafRef = useRef(null);
   const cbRef  = useRef(callback);
@@ -344,9 +365,11 @@ class HashRouter extends Component {
     if (m) { params = { moodId: m[1] }; route = "/playlist/:moodId"; }
     return { path: route, params };
   }
-  componentDidMount()         { window.addEventListener("hashchange", this._hashHandler); }
-  componentDidUpdate(_, prev) { if (prev.path !== this.state.path) window.scrollTo({ top: 0, behavior: "smooth" }); }
-  componentWillUnmount()      { window.removeEventListener("hashchange", this._hashHandler); }
+  componentDidMount()    { window.addEventListener("hashchange", this._hashHandler); }
+  componentDidUpdate(_, prev) {
+    if (prev.path !== this.state.path) window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+  componentWillUnmount() { window.removeEventListener("hashchange", this._hashHandler); }
   _hashHandler() { this.setState(this._parseHash()); }
   navigate(to)   { window.location.hash = to; }
   goBack()       { window.history.back(); }
@@ -379,11 +402,7 @@ ThemeProvider.defaultProps = { moodId: null };
 //12) SPOTIFY PROVIDER
 function SpotifyProvider({ children }) {
   const auth = useSpotifyAuth();
-  return (
-    <SpotifyContext.Provider value={auth}>
-      {children}
-    </SpotifyContext.Provider>
-  );
+  return <SpotifyContext.Provider value={auth}>{children}</SpotifyContext.Provider>;
 }
 SpotifyProvider.displayName = "SpotifyProvider";
 SpotifyProvider.propTypes   = { children: PropTypes.node.isRequired };
@@ -396,7 +415,7 @@ function SpaceBackground({ palette }) {
     const canvas = canvasRef.current; if (!canvas) return;
     let W = canvas.width = window.innerWidth, H = canvas.height = window.innerHeight;
     dataRef.current = {
-      warp: Array.from({ length: 180 }, () => ({ angle: Math.random() * Math.PI * 2, dist: Math.random() * 0.6, speed: Math.random() * 0.004 + 0.001, alpha: Math.random() })),
+      warp:    Array.from({ length: 180 }, () => ({ angle: Math.random() * Math.PI * 2, dist: Math.random() * 0.6, speed: Math.random() * 0.004 + 0.001, alpha: Math.random() })),
       twinkle: Array.from({ length: 130 }, () => ({ x: Math.random() * W, y: Math.random() * H, r: Math.random() * 1.6 + 0.3, phase: Math.random() * Math.PI * 2, speed: Math.random() * 0.03 + 0.01 })),
       orbs: [{ xf: 0.13, yf: 0.22, r: 160, ci: 0 }, { xf: 0.85, yf: 0.68, r: 145, ci: 1 }, { xf: 0.50, yf: 0.82, r: 110, ci: 0 }, { xf: 0.08, yf: 0.78, r: 90, ci: 1 }, { xf: 0.88, yf: 0.14, r: 115, ci: 0 }],
       W, H,
@@ -518,11 +537,7 @@ const SpotifySongRow = memo(function SpotifySongRow({ track, index, playingId, o
     <div
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
-      style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 14px", borderRadius: 10, transition: "all 0.22s",
-        background: isPlaying ? `${palette.accent}22` : hov ? `${palette.accent}14` : `${palette.accent}07`,
-        border: `1px solid ${isPlaying ? palette.accent + "70" : hov ? palette.accent + "40" : palette.accent + "18"}`,
-        animation: `fadeUp 0.4s ${index * 0.06}s both`,
-      }}
+      style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 14px", borderRadius: 10, transition: "all 0.22s", background: isPlaying ? `${palette.accent}22` : hov ? `${palette.accent}14` : `${palette.accent}07`, border: `1px solid ${isPlaying ? palette.accent + "70" : hov ? palette.accent + "40" : palette.accent + "18"}`, animation: `fadeUp 0.4s ${index * 0.06}s both` }}
     >
       <button
         onClick={() => hasPreview && onToggle(track.id, track.preview_url)}
@@ -537,8 +552,7 @@ const SpotifySongRow = memo(function SpotifySongRow({ track, index, playingId, o
       </button>
 
       {thumb ? (
-        <img src={thumb} alt="" width={38} height={38}
-          style={{ borderRadius: 6, objectFit: "cover", flexShrink: 0, border: `1px solid ${palette.accent}20` }} />
+        <img src={thumb} alt="" width={38} height={38} style={{ borderRadius: 6, objectFit: "cover", flexShrink: 0, border: `1px solid ${palette.accent}20` }} />
       ) : (
         <div style={{ width: 38, height: 38, borderRadius: 6, background: `${palette.accent}18`, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>♪</div>
       )}
@@ -553,10 +567,7 @@ const SpotifySongRow = memo(function SpotifySongRow({ track, index, playingId, o
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
         <span style={{ fontSize: 11, color: palette.muted }}>{durStr}</span>
         {spotifyUrl && (
-          <a href={spotifyUrl} target="_blank" rel="noopener noreferrer"
-            style={{ display: "flex", alignItems: "center", opacity: hov ? 1 : 0.45, transition: "opacity 0.2s" }}
-            title="Open in Spotify"
-          >
+          <a href={spotifyUrl} target="_blank" rel="noopener noreferrer" style={{ display: "flex", alignItems: "center", opacity: hov ? 1 : 0.45, transition: "opacity 0.2s" }} title="Open in Spotify">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="#1DB954">
               <path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z" />
             </svg>
@@ -587,7 +598,7 @@ function SpotifyConnectBanner() {
       </div>
 
       <h2 style={{ fontFamily: "'Playfair Display',serif", color: palette.text, fontSize: 22, marginBottom: 10 }}>Connect Spotify</h2>
-      <p style={{ color: palette.muted, fontSize: 13, lineHeight: 1.7, marginBottom: 24, maxWidth: 380, margin: "0 auto 24px" }}>
+      <p style={{ color: palette.muted, fontSize: 13, lineHeight: 1.7, maxWidth: 380, margin: "0 auto 24px" }}>
         Link your Spotify account to get real playlists, album art, and 30-second track previews — all matched to your mood.
       </p>
 
@@ -603,7 +614,7 @@ function SpotifyConnectBanner() {
       </button>
 
       {authError && (
-        <div style={{ marginTop: 16, padding: "10px 18px", borderRadius: 8, background: "#ff004418", border: "1px solid #ff004440", color: "#ff6688", fontSize: 12, animation: "fadeUp 0.3s both" }}>
+        <div style={{ marginTop: 16, padding: "10px 18px", borderRadius: 8, background: "#ff004418", border: "1px solid #ff004440", color: "#ff6688", fontSize: 12, animation: "fadeUp 0.3s both", textAlign: "left", lineHeight: 1.6 }}>
           {authError}
         </div>
       )}
@@ -611,6 +622,10 @@ function SpotifyConnectBanner() {
       <p style={{ color: palette.muted, fontSize: 11, marginTop: 20, opacity: 0.5 }}>
         Uses PKCE OAuth — no password stored · Token valid for 1 hour
       </p>
+
+      <div style={{ marginTop: 14, padding: "10px 16px", borderRadius: 8, background: `${palette.accent}0d`, border: `1px solid ${palette.accent}22`, fontSize: 11, color: palette.muted, textAlign: "left", lineHeight: 1.7 }}>
+        <strong style={{ color: palette.accent }}>Dev Mode note:</strong> All users must be added to the app's User Management allowlist in the Spotify Developer Dashboard. The app owner must have Spotify Premium (required as of Feb 2026).
+      </div>
     </div>
   );
 }
@@ -640,8 +655,10 @@ class HomeView extends Component {
   componentWillUnmount() { clearInterval(this._timer); }
   _getGreeting() {
     const h = new Date().getHours();
-    if (h < 5) return "Night session"; if (h < 12) return "Good morning";
-    if (h < 17) return "Good afternoon"; if (h < 21) return "Good evening";
+    if (h < 5)  return "Night session";
+    if (h < 12) return "Good morning";
+    if (h < 17) return "Good afternoon";
+    if (h < 21) return "Good evening";
     return "Night owl mode";
   }
   _handleSelect(id) { this.setState({ selectedMood: id }); this.props.onMoodSelect(id); }
@@ -678,14 +695,14 @@ HomeView.defaultProps = { onMoodPreview: null, preselectedMood: null };
 
 //20) PLAYLIST VIEW
 function PlaylistView() {
-  const { params, navigate }     = useContext(RouterContext);
-  const { palette }              = useContext(ThemeContext);
+  const { params, navigate }    = useContext(RouterContext);
+  const { palette }             = useContext(ThemeContext);
   const { token, isAuthenticated,
-          login, authError }     = useContext(SpotifyContext);
+          login, authError }    = useContext(SpotifyContext);
   const { playlist, tracks,
           loading, error,
-          search, reset }        = useSpotifyMoodPlaylist(token);
-  const { playingId, toggle }    = useAudioPreview();
+          search, reset }       = useSpotifyMoodPlaylist(token);
+  const { playingId, toggle }   = useAudioPreview();
 
   const mood = useMemo(() => MOODS.find(m => m.id === params.moodId), [params.moodId]);
 
@@ -717,8 +734,8 @@ function PlaylistView() {
   );
 
   if (error) return (
-    <div style={{ textAlign: "center", padding: 40, maxWidth: 480 }}>
-      <div style={{ padding: "13px 20px", borderRadius: 10, background: "#ff004420", border: "1px solid #ff004455", color: "#ff6688", fontSize: 13, marginBottom: 16 }}>{error}</div>
+    <div style={{ textAlign: "center", padding: 40, maxWidth: 500 }}>
+      <div style={{ padding: "13px 20px", borderRadius: 10, background: "#ff004420", border: "1px solid #ff004455", color: "#ff6688", fontSize: 13, marginBottom: 16, textAlign: "left", lineHeight: 1.6 }}>{error}</div>
       <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
         <button onClick={() => search(params.moodId)} style={btn(palette)}>↺ Retry</button>
         <button onClick={handleBack} style={btn(palette)}>← New Mood</button>
@@ -732,16 +749,11 @@ function PlaylistView() {
   const playlistUrl   = playlist.external_urls?.spotify;
   const totalPreviews = tracks.filter(t => t.preview_url).length;
 
-  // FIX #4 (Feb 2026): tracks may be empty for third-party public playlists in dev mode.
-  // We still show the playlist header + a helpful message so users can open it on Spotify.
-  const hasNoTracks = tracks.length === 0;
-
   return (
     <div style={{ width: "100%", maxWidth: 640, animation: "cardIn 0.65s both" }}>
       <div style={{ display: "flex", gap: 18, padding: "20px 22px", borderRadius: "16px 16px 0 0", background: `${palette.accent}10`, border: `1px solid ${palette.accent}30`, borderBottom: "none", backdropFilter: "blur(18px)", alignItems: "flex-start" }}>
         {playlistCover ? (
-          <img src={playlistCover} alt={playlist.name}
-            style={{ width: 90, height: 90, borderRadius: 10, objectFit: "cover", flexShrink: 0, boxShadow: `0 4px 20px ${palette.glow}40`, border: `1px solid ${palette.accent}30` }} />
+          <img src={playlistCover} alt={playlist.name} style={{ width: 90, height: 90, borderRadius: 10, objectFit: "cover", flexShrink: 0, boxShadow: `0 4px 20px ${palette.glow}40`, border: `1px solid ${palette.accent}30` }} />
         ) : (
           <div style={{ width: 90, height: 90, borderRadius: 10, background: `${palette.accent}20`, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32 }}>{mood?.emoji}</div>
         )}
@@ -773,32 +785,13 @@ function PlaylistView() {
       </div>
 
       <div style={{ padding: "12px 12px 14px", background: "rgba(0,0,0,0.65)", border: `1px solid ${palette.accent}28`, borderRadius: "0 0 16px 16px", backdropFilter: "blur(18px)", display: "flex", flexDirection: "column", gap: 4 }}>
-        {hasNoTracks ? (
-          // Graceful fallback for Feb 2026 Spotify API restriction:
-          // public playlist track contents are no longer returned in dev mode.
-          <div style={{ padding: "24px 14px", textAlign: "center" }}>
-            <div style={{ fontSize: 28, marginBottom: 10 }}>🎵</div>
-            <div style={{ color: palette.text, fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Track list unavailable in preview</div>
-            <div style={{ color: palette.muted, fontSize: 12, lineHeight: 1.7, maxWidth: 380, margin: "0 auto 16px" }}>
-              Due to Spotify API restrictions in developer mode, track details for third-party playlists can't be shown inline. Open the playlist directly on Spotify to listen.
-            </div>
-            {playlistUrl && (
-              <a href={playlistUrl} target="_blank" rel="noopener noreferrer"
-                style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "10px 22px", borderRadius: 20, background: "#1DB954", color: "#000", fontSize: 12, fontWeight: 700, textDecoration: "none" }}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="#000"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z" /></svg>
-                Listen on Spotify
-              </a>
-            )}
-          </div>
-        ) : (
-          tracks.map((track, i) => (
-            <SpotifySongRow key={track.id ?? i} track={track} index={i} playingId={playingId} onToggle={toggle} />
-          ))
-        )}
+        {tracks.map((track, i) => (
+          <SpotifySongRow key={track.id ?? i} track={track} index={i} playingId={playingId} onToggle={toggle} />
+        ))}
 
         <div style={{ marginTop: 10, paddingTop: 12, borderTop: `1px solid ${palette.accent}18`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
           <div style={{ fontSize: 10, color: palette.muted, display: "flex", gap: 10, alignItems: "center" }}>
-            {!hasNoTracks && <span>{tracks.length} tracks shown</span>}
+            <span>{tracks.length} tracks shown</span>
             {totalPreviews > 0 && <span style={{ color: "#1DB95488" }}>▶ {totalPreviews} previews · click to play</span>}
           </div>
           <button onClick={handleBack} style={btn(palette)}>← New Mood</button>
@@ -829,9 +822,7 @@ function AboutView() {
     <div style={{ width: "100%", maxWidth: 640, animation: "fadeUp 0.6s both" }}>
       <div style={{ ...card, padding: "28px 28px 24px", marginBottom: 12 }}>
         <div style={{ fontSize: 10, letterSpacing: 4, color: palette.accent, textTransform: "uppercase", marginBottom: 12 }}>About MoodPlay</div>
-        <h2 style={{ fontFamily: "'Playfair Display',serif", color: palette.text, fontSize: 24, lineHeight: 1.25, marginBottom: 14 }}>
-          Your mood, turned into a soundtrack.
-        </h2>
+        <h2 style={{ fontFamily: "'Playfair Display',serif", color: palette.text, fontSize: 24, lineHeight: 1.25, marginBottom: 14 }}>Your mood, turned into a soundtrack.</h2>
         <p style={{ color: palette.muted, fontSize: 13, lineHeight: 1.85, marginBottom: 12 }}>
           MoodPlay is a playlist generator that maps how you feel right now to real music from Spotify. Rather than searching for songs yourself, you pick an emotional frequency — euphoric, melancholic, focused, rebellious, and five more — and MoodPlay finds a curated Spotify playlist that fits it, then surfaces the top tracks so you can start listening immediately.
         </p>
@@ -893,7 +884,7 @@ function AppShell({ onMoodSelect, onMoodPreview, activeMoodId }) {
   const { palette: bgPalette } = useMoodTheme(bgId);
   const SPHERES = [
     { top: "-10px",   left: "-10px",   size: 130, delay: "0s",   opacity: 1    },
-    { bottom: "-15px",right: "-15px",  size: 155, delay: "1.2s", opacity: 1    },
+    { bottom: "-15px", right: "-15px", size: 155, delay: "1.2s", opacity: 1    },
     { bottom: "18%",  left: "-28px",   size: 85,  delay: "2.5s", opacity: 0.5  },
     { top: "30%",     right: "-20px",  size: 75,  delay: "0.8s", opacity: 0.45 },
   ];
@@ -937,7 +928,12 @@ class App extends Component {
     this.handleMoodPreview = this.handleMoodPreview.bind(this);
   }
   componentDidMount()    { document.title = "MoodPlay · Spotify Playlist Generator"; }
-  componentDidUpdate(_, p) { if (p.activeMoodId !== this.state.activeMoodId) { const m = MOODS.find(m => m.id === this.state.activeMoodId); document.title = m ? `${m.label} · MoodPlay` : "MoodPlay"; } }
+  componentDidUpdate(_, p) {
+    if (p.activeMoodId !== this.state.activeMoodId) {
+      const m = MOODS.find(m => m.id === this.state.activeMoodId);
+      document.title = m ? `${m.label} · MoodPlay` : "MoodPlay";
+    }
+  }
   componentWillUnmount() { document.title = "MoodPlay"; }
   handleMoodSelect(id)   { this.setState({ activeMoodId: id, previewMoodId: id }); window.location.hash = `/playlist/${id}`; }
   handleMoodPreview(id)  { this.setState({ previewMoodId: id ?? this.state.activeMoodId }); }
